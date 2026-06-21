@@ -1,0 +1,77 @@
+name: dry-run-tests
+
+# Build + unit tests across Linux/macOS/Windows, plus the `--dry-run` integration
+# tests on Ubuntu against both Docker and Podman. The integration job is heavy
+# (it pulls the ~700MB uber-native image and starts real containers), so it runs
+# only on pull requests and manual dispatch — not on every push.
+on:
+  push:
+    paths-ignore:
+      - '.gitignore'
+      - 'LICENSE'
+      - '*.md'
+  pull_request:
+    paths-ignore:
+      - '.gitignore'
+      - 'LICENSE'
+      - '*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-unit:
+    name: build + unit (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Setup Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: ./go.mod
+          cache-dependency-path: ./go.sum
+      - name: Build
+        run: go build ./...
+      - name: Unit tests
+        run: go test ./...
+
+  integration:
+    name: integration (${{ matrix.runtime }})
+    needs: build-unit
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [docker, podman]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Setup Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: ./go.mod
+          cache-dependency-path: ./go.sum
+
+      # Docker is preinstalled and running on ubuntu-latest; nothing to do.
+      - name: Configure Podman as the container runtime
+        if: matrix.runtime == 'podman'
+        run: |
+          set -euxo pipefail
+          # ubuntu-latest ships podman; ensure the rootless API socket is up.
+          systemctl --user enable --now podman.socket || \
+            (podman system service --time=0 "unix://${XDG_RUNTIME_DIR}/podman/podman.sock" &)
+          # Give the socket a moment, then point testcontainers-go at podman.
+          sleep 3
+          echo "DOCKER_HOST=unix://${XDG_RUNTIME_DIR}/podman/podman.sock" >> "$GITHUB_ENV"
+          # Ryuk needs privileges rootless podman lacks; the CLI's own teardown covers cleanup.
+          echo "TESTCONTAINERS_RYUK_DISABLED=true" >> "$GITHUB_ENV"
+
+      - name: Integration tests (${{ matrix.runtime }})
+        run: go test -tags integration -run TestDryRunIntegration -timeout 600s -v ./cmd/
