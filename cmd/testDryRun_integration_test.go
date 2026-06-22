@@ -32,6 +32,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -67,7 +68,11 @@ func ensureCLI(t *testing.T) string {
 			cliBuildErr = err
 			return
 		}
-		cliBinPath = filepath.Join(dir, "microcks")
+		binName := "microcks"
+		if runtime.GOOS == "windows" {
+			binName += ".exe"
+		}
+		cliBinPath = filepath.Join(dir, binName)
 		out, err := exec.Command("go", "build", "-o", cliBinPath, "github.com/microcks/microcks-cli").CombinedOutput()
 		if err != nil {
 			cliBuildErr = errors.New("build microcks binary: " + err.Error() + "\n" + string(out))

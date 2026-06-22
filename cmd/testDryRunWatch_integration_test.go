@@ -25,7 +25,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -85,6 +84,7 @@ func TestDryRunIntegrationWatch(t *testing.T) {
 		t.Fatalf("stdout pipe: %v", err)
 	}
 	cmd.Stderr = os.Stderr
+	configureSignaling(cmd)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start watch: %v", err)
 	}
@@ -129,8 +129,8 @@ func TestDryRunIntegrationWatch(t *testing.T) {
 	}
 
 	// Ctrl+C / SIGTERM must exit cleanly (code 0) and tear the container down.
-	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatalf("send SIGTERM: %v", err)
+	if err := terminateGracefully(cmd.Process); err != nil {
+		t.Fatalf("send termination signal: %v", err)
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
