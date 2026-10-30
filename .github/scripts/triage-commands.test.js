@@ -20,8 +20,11 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { parseCommands, plan, run, labelNewIssue } = require('./triage-commands.js');
 
-const maintainer = { commenter: 'alice', author: 'bob', isMaintainer: true, isPullRequest: false, labels: [], assignees: [] };
-const contributor = { ...maintainer, commenter: 'carol', isMaintainer: false };
+const maintainer = { commenter: 'alice', author: 'bob', isMaintainer: true, isContributor: true, isPullRequest: false, labels: [], assignees: [] };
+// A newcomer without commits in the repository.
+const contributor = { ...maintainer, commenter: 'carol', isMaintainer: false, isContributor: false };
+// Someone who already has commits in the repository.
+const pastContributor = { ...contributor, commenter: 'dan', isContributor: true };
 
 test('parseCommands reads commands at the start of lines', () => {
   assert.deepEqual(parseCommands('Looks good.\n/triage accepted\n  /kind bug\n/assign @dave'), [
@@ -77,11 +80,40 @@ test('unknown label values are reported', () => {
   assert.match(r.errors[0], /expects one of/);
 });
 
-test('contributors cannot use maintainer commands', () => {
+test('newcomers cannot triage or label', () => {
   const r = plan(parseCommands('/triage accepted\n/kind bug\n/keep-open\n/good-first-issue'), contributor);
   assert.equal(r.addLabels.length, 0);
   assert.equal(r.errors.length, 4);
-  assert.match(r.errors[0], /only be used by maintainers/);
+  assert.match(r.errors[0], /people who have contributed/);
+  assert.match(r.errors[2], /only be used by maintainers/);
+});
+
+test('past contributors can triage and label other people\'s issues', () => {
+  const r = plan(parseCommands('/triage accepted\n/kind bug\n/area cli\n/good-first-issue'), { ...pastContributor, labels: ['needs-triage'] });
+  assert.deepEqual(r.addLabels, ['triage/accepted', 'kind/bug', 'component/cli', 'good first issue']);
+  assert.deepEqual(r.removeLabels, ['needs-triage']);
+  assert.deepEqual(r.errors, []);
+});
+
+test('past contributors cannot triage their own issue', () => {
+  const r = plan(parseCommands('/triage accepted\n/kind bug'), { ...pastContributor, author: 'dan' });
+  assert.equal(r.addLabels.length, 0);
+  assert.equal(r.errors.length, 2);
+  assert.match(r.errors[0], /can't be used on your own issue/);
+});
+
+test('maintainers can triage their own issue', () => {
+  const r = plan(parseCommands('/triage accepted'), { ...maintainer, author: 'alice' });
+  assert.deepEqual(r.addLabels, ['triage/accepted']);
+});
+
+test('only maintainers can remove labels or use /keep-open', () => {
+  const labels = ['triage/accepted', 'kind/bug', 'good first issue'];
+  const r = plan(parseCommands('/remove-triage\n/remove-kind bug\n/remove-good-first-issue\n/keep-open'), { ...pastContributor, labels });
+  assert.deepEqual(r.removeLabels, []);
+  assert.deepEqual(r.addLabels, []);
+  assert.equal(r.errors.length, 4);
+  r.errors.forEach((e) => assert.match(e, /only be used by maintainers/));
 });
 
 test('/good-first-issue and /help need triage/accepted on issues', () => {
@@ -173,11 +205,11 @@ function fakeGithub({ permission = 'read', assignable = () => true } = {}) {
 
 const core = { warning: () => {} };
 
-function contextFor(body, { login = 'alice', type = 'User', labels = [], pr = false } = {}) {
+function contextFor(body, { login = 'alice', type = 'User', labels = [], pr = false, association = 'NONE' } = {}) {
   return {
     repo: { owner: 'microcks', repo: 'microcks-cli' },
     payload: {
-      comment: { id: 99, body, user: { login, type } },
+      comment: { id: 99, body, user: { login, type }, author_association: association },
       issue: {
         number: 7,
         user: { login: 'bob' },
@@ -206,6 +238,13 @@ test('run treats non-collaborators (404) as contributors and explains', async ()
   assert.equal(calls[1][1].content, 'confused');
   assert.match(calls[2][1].body, /@carol thanks! Some commands were not applied/);
   assert.match(calls[2][1].body, /triage-commands\.md/);
+});
+
+test('run lets past contributors triage using the comment author association', async () => {
+  const { github, calls } = fakeGithub({ permission: 'read' });
+  await run({ github, context: contextFor('/triage accepted', { login: 'dan', labels: ['needs-triage'], association: 'CONTRIBUTOR' }), core });
+  assert.deepEqual(calls.map(([n]) => n), ['permission', 'removeLabel', 'addLabels', 'reaction']);
+  assert.deepEqual(calls[2][1].labels, ['triage/accepted']);
 });
 
 test('run reports users GitHub would not assign', async () => {

@@ -54,6 +54,8 @@ const FLAGS = {
 };
 
 const MAINTAINER_PERMISSIONS = ['admin', 'maintain', 'write'];
+// GitHub author associations of people who already have commits in the repository.
+const CONTRIBUTOR_ASSOCIATIONS = ['CONTRIBUTOR', 'COLLABORATOR', 'MEMBER', 'OWNER'];
 const MAX_COMMANDS = 10;
 
 /**
@@ -90,7 +92,11 @@ function parseCommands(body) {
  * Turns parsed commands into the changes to apply. Pure function so it can be
  * unit tested without the GitHub API.
  *
- * ctx: { commenter, author, isMaintainer, isPullRequest, labels, assignees, state }
+ * ctx: { commenter, author, isMaintainer, isContributor, isPullRequest, labels, assignees }
+ *
+ * Maintainers can use every command. Contributors (people with commits in the
+ * repository) can add triage and label values, but not on their own issues;
+ * removing labels stays with maintainers so they can correct a triage.
  * returns: { addLabels, removeLabels, assign, unassign, state, errors }
  */
 function plan(commands, ctx) {
@@ -111,9 +117,22 @@ function plan(commands, ctx) {
     }
     out.addLabels = out.addLabels.filter((l) => l !== label);
   };
+  const isAuthor = Boolean(ctx.author) && ctx.author.toLowerCase() === ctx.commenter.toLowerCase();
   const needMaintainer = (cmd) => {
     if (!ctx.isMaintainer) {
       out.errors.push(`\`/${cmd}\` can only be used by maintainers.`);
+      return false;
+    }
+    return true;
+  };
+  const needTriager = (cmd) => {
+    if (ctx.isMaintainer) return true;
+    if (!ctx.isContributor) {
+      out.errors.push(`\`/${cmd}\` can be used by maintainers and by people who have contributed to this repository.`);
+      return false;
+    }
+    if (isAuthor) {
+      out.errors.push(`\`/${cmd}\` can't be used on your own ${ctx.isPullRequest ? 'pull request' : 'issue'}. Another contributor or a maintainer will triage it.`);
       return false;
     }
     return true;
@@ -128,7 +147,7 @@ function plan(commands, ctx) {
   const labelCommand = (name, table, args) => {
     const removing = name.startsWith('remove-');
     const base = removing ? name.slice('remove-'.length) : name;
-    if (!needMaintainer(name)) return;
+    if (!(removing ? needMaintainer(name) : needTriager(name))) return;
     if (args.length === 0) {
       out.errors.push(`\`/${name}\` expects one of: ${Object.keys(table).map((k) => `\`${k}\``).join(', ')}.`);
       return;
@@ -142,7 +161,7 @@ function plan(commands, ctx) {
   for (const { name, args } of commands) {
     switch (name) {
       case 'triage': {
-        if (!needMaintainer(name)) break;
+        if (!needTriager(name)) break;
         const label = mapped(name, TRIAGE, args[0]);
         if (!label) break;
         for (const l of Object.values(TRIAGE)) if (l !== label) remove(l);
@@ -170,7 +189,8 @@ function plan(commands, ctx) {
       case 'help':
       case 'good-first-issue':
       case 'keep-open': {
-        if (!needMaintainer(name)) break;
+        // keep-open exempts an item from the stale bot, so it stays with maintainers.
+        if (!(name === 'keep-open' ? needMaintainer(name) : needTriager(name))) break;
         if (name !== 'keep-open' && !ctx.isPullRequest && !labels.has(TRIAGE_ACCEPTED)) {
           out.errors.push(`\`/${name}\` needs the issue to be accepted first: use \`/triage accepted\`.`);
           break;
@@ -214,7 +234,6 @@ function plan(commands, ctx) {
       }
       case 'close':
       case 'reopen': {
-        const isAuthor = ctx.author && ctx.author.toLowerCase() === ctx.commenter.toLowerCase();
         if (!ctx.isMaintainer && !isAuthor) {
           out.errors.push(`\`/${name}\` can only be used by maintainers or the author.`);
           break;
@@ -256,10 +275,12 @@ async function run({ github, context, core }) {
   const issue_number = issue.number;
   const commenter = comment.user.login;
 
+  const maintainer = await isMaintainer(github, owner, repo, commenter);
   const result = plan(commands, {
     commenter,
     author: issue.user && issue.user.login,
-    isMaintainer: await isMaintainer(github, owner, repo, commenter),
+    isMaintainer: maintainer,
+    isContributor: maintainer || CONTRIBUTOR_ASSOCIATIONS.includes(comment.author_association),
     isPullRequest: Boolean(issue.pull_request),
     labels: (issue.labels || []).map((l) => (typeof l === 'string' ? l : l.name)),
     assignees: (issue.assignees || []).map((a) => a.login),
