@@ -16,7 +16,7 @@ Please wait for `triage/accepted` before starting work. It avoids spending time 
 | --- | --- |
 | `/assign` | Assigns yourself. On issues, only once the issue has `triage/accepted`. |
 | `/unassign` | Unassigns yourself. |
-| `/close`, `/reopen` | Closes or reopens an issue or pull request you opened. |
+| `/close`, `/reopen` | Closes or reopens an issue or pull request you opened. You can only reopen it if you closed it yourself; if a maintainer closed it, ask them. |
 
 ## Commands for contributors and maintainers
 
@@ -44,6 +44,19 @@ Maintainers are people with write access to this repository. They can use every 
 | `/keep-open` | Adds `keep-open`, so the stale bot skips the item. `/remove-keep-open` removes it. |
 | `/assign @user`, `/unassign @user` | Assigns or unassigns someone else. GitHub only lets you assign people who have commented on the issue or have access to the repository. |
 | `/close`, `/reopen` | Closes or reopens any issue or pull request. |
+
+## Pull request commands
+
+These commands only work in pull request comments. `lgtm`, `approved` and `do-not-merge/hold` are review signals for maintainers: merging still needs an approving GitHub review from a code owner.
+
+| Command | Who | Effect |
+| --- | --- | --- |
+| `/lgtm` | Contributors and maintainers, not on their own pull request | Adds `lgtm`. |
+| `/approve` | Maintainers | Adds `approved`. |
+| `/remove-lgtm` (`/lgtm cancel`), `/remove-approve` (`/approve cancel`) | Maintainers | Removes `lgtm` or `approved`. |
+| `/hold`, `/unhold` (`/hold cancel`) | Contributors, maintainers and the author | Adds or removes `do-not-merge/hold`. The `hold` check fails while the label is set. |
+| `/retest` | Maintainers and the author | Re-runs the failed checks on the latest commit. |
+| `/cc @user`, `/uncc @user` | Contributors, maintainers and the author | Requests or removes a review from someone. |
 
 Commands inside code blocks or quoted lines (`> /kind bug`) are ignored, and unknown commands are ignored silently.
 

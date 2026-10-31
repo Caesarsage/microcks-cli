@@ -14,40 +14,18 @@
  * limitations under the License.
  */
 
-// Run with: node --test .github/scripts/triage-commands.test.js
+// Run with: node --test hack/triage/test/*.test.js
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { parseCommands, plan, run, labelNewIssue } = require('./triage-commands.js');
+const { parseCommands } = require('../parse');
+const { plan } = require('../plan');
 
-const maintainer = { commenter: 'alice', author: 'bob', isMaintainer: true, isContributor: true, isPullRequest: false, labels: [], assignees: [] };
+const maintainer = { commenter: 'alice', author: 'bob', isMaintainer: true, isContributor: true, isPullRequest: false, labels: [] };
 // A newcomer without commits in the repository.
 const contributor = { ...maintainer, commenter: 'carol', isMaintainer: false, isContributor: false };
 // Someone who already has commits in the repository.
 const pastContributor = { ...contributor, commenter: 'dan', isContributor: true };
-
-test('parseCommands reads commands at the start of lines', () => {
-  assert.deepEqual(parseCommands('Looks good.\n/triage accepted\n  /kind bug\n/assign @dave'), [
-    { name: 'triage', args: ['accepted'] },
-    { name: 'kind', args: ['bug'] },
-    { name: 'assign', args: ['dave'] },
-  ]);
-});
-
-test('parseCommands ignores code blocks, quotes, inline slashes and paths', () => {
-  const body = [
-    '```', '/close', '```',
-    '> /kind bug',
-    'please run `/assign`',
-    'see cmd/test.go',
-    '/usr/local/bin/microcks',
-  ].join('\n');
-  assert.deepEqual(parseCommands(body), []);
-});
-
-test('parseCommands caps the number of commands', () => {
-  assert.equal(parseCommands(Array(50).fill('/kind bug').join('\n')).length, 10);
-});
 
 test('/triage accepted replaces needs-triage and other triage labels', () => {
   const r = plan(parseCommands('/triage accepted'), { ...maintainer, labels: ['needs-triage', 'triage/needs-information'] });
@@ -171,105 +149,92 @@ test('/close and /reopen work for maintainers and the author only', () => {
   assert.equal(r.errors.length, 1);
 });
 
+test('authors can reopen only what they closed themselves', () => {
+  const author = { ...contributor, commenter: 'bob' };
+  assert.equal(plan(parseCommands('/reopen'), { ...author, closedBy: 'bob' }).state, 'open');
+
+  const r = plan(parseCommands('/reopen'), { ...author, closedBy: 'alice' });
+  assert.equal(r.state, null);
+  assert.match(r.errors[0], /a maintainer closed/);
+
+  assert.equal(plan(parseCommands('/reopen'), { ...maintainer, closedBy: 'erin' }).state, 'open');
+});
+
 test('unknown commands are ignored without errors', () => {
-  const r = plan(parseCommands('/lgtm\n/approve\n/cc @dave'), contributor);
-  assert.deepEqual(r, { addLabels: [], removeLabels: [], assign: [], unassign: [], state: null, errors: [] });
+  const r = plan(parseCommands('/test all\n/meow'), contributor);
+  assert.deepEqual(r, {
+    addLabels: [], removeLabels: [], assign: [], unassign: [], reviewers: [], unreviewers: [], retest: false, state: null, errors: [],
+  });
 });
 
-// --- run() against a fake GitHub client ---
+const prMaintainer = { ...maintainer, isPullRequest: true };
+const prPastContributor = { ...pastContributor, isPullRequest: true };
+const prNewcomer = { ...contributor, isPullRequest: true };
 
-function fakeGithub({ permission = 'read', assignable = () => true } = {}) {
-  const calls = [];
-  const record = (name, fn = () => ({ data: {} })) => async (args) => { calls.push([name, args]); return fn(args); };
-  const github = {
-    rest: {
-      repos: {
-        getCollaboratorPermissionLevel: record('permission', () => {
-          if (permission === null) { const e = new Error('Not Found'); e.status = 404; throw e; }
-          return { data: { permission } };
-        }),
-      },
-      issues: {
-        addLabels: record('addLabels'),
-        removeLabel: record('removeLabel'),
-        addAssignees: record('addAssignees', ({ assignees }) => ({ data: { assignees: assignees.filter(assignable).map((login) => ({ login })) } })),
-        removeAssignees: record('removeAssignees'),
-        update: record('update'),
-        createComment: record('createComment'),
-      },
-      reactions: { createForIssueComment: record('reaction') },
-    },
-  };
-  return { github, calls };
-}
-
-const core = { warning: () => {} };
-
-function contextFor(body, { login = 'alice', type = 'User', labels = [], pr = false, association = 'NONE' } = {}) {
-  return {
-    repo: { owner: 'microcks', repo: 'microcks-cli' },
-    payload: {
-      comment: { id: 99, body, user: { login, type }, author_association: association },
-      issue: {
-        number: 7,
-        user: { login: 'bob' },
-        labels: labels.map((name) => ({ name })),
-        assignees: [],
-        ...(pr ? { pull_request: {} } : {}),
-      },
-    },
-  };
-}
-
-test('run applies maintainer commands and reacts with +1', async () => {
-  const { github, calls } = fakeGithub({ permission: 'write' });
-  await run({ github, context: contextFor('/triage accepted\n/kind bug', { labels: ['needs-triage'] }), core });
-  const names = calls.map(([n]) => n);
-  assert.deepEqual(names, ['permission', 'removeLabel', 'addLabels', 'reaction']);
-  assert.deepEqual(calls[2][1].labels, ['triage/accepted', 'kind/bug']);
-  assert.equal(calls[3][1].content, '+1');
+test('pull request commands are rejected on issues', () => {
+  const r = plan(parseCommands('/lgtm\n/approve\n/hold\n/retest\n/cc @dave'), maintainer);
+  assert.deepEqual(r.addLabels, []);
+  assert.equal(r.retest, false);
+  assert.equal(r.errors.length, 5);
+  r.errors.forEach((e) => assert.match(e, /only be used on pull requests/));
 });
 
-test('run treats non-collaborators (404) as contributors and explains', async () => {
-  const { github, calls } = fakeGithub({ permission: null });
-  await run({ github, context: contextFor('/triage accepted', { login: 'carol' }), core });
-  const names = calls.map(([n]) => n);
-  assert.deepEqual(names, ['permission', 'reaction', 'createComment']);
-  assert.equal(calls[1][1].content, 'confused');
-  assert.match(calls[2][1].body, /@carol thanks! Some commands were not applied/);
-  assert.match(calls[2][1].body, /triage-commands\.md/);
+test('/lgtm is for maintainers and past contributors, never on their own pull request', () => {
+  assert.deepEqual(plan(parseCommands('/lgtm'), prPastContributor).addLabels, ['lgtm']);
+  assert.deepEqual(plan(parseCommands('/lgtm'), prMaintainer).addLabels, ['lgtm']);
+
+  const newcomer = plan(parseCommands('/lgtm'), prNewcomer);
+  assert.deepEqual(newcomer.addLabels, []);
+  assert.match(newcomer.errors[0], /people who have contributed/);
+
+  const own = plan(parseCommands('/lgtm'), { ...prMaintainer, author: 'alice' });
+  assert.deepEqual(own.addLabels, []);
+  assert.match(own.errors[0], /your own pull request/);
 });
 
-test('run lets past contributors triage using the comment author association', async () => {
-  const { github, calls } = fakeGithub({ permission: 'read' });
-  await run({ github, context: contextFor('/triage accepted', { login: 'dan', labels: ['needs-triage'], association: 'CONTRIBUTOR' }), core });
-  assert.deepEqual(calls.map(([n]) => n), ['permission', 'removeLabel', 'addLabels', 'reaction']);
-  assert.deepEqual(calls[2][1].labels, ['triage/accepted']);
+test('/approve is maintainer-only, including on their own pull request', () => {
+  assert.deepEqual(plan(parseCommands('/approve'), { ...prMaintainer, author: 'alice' }).addLabels, ['approved']);
+  const r = plan(parseCommands('/approve'), prPastContributor);
+  assert.deepEqual(r.addLabels, []);
+  assert.match(r.errors[0], /only be used by maintainers/);
 });
 
-test('run reports users GitHub would not assign', async () => {
-  const { github, calls } = fakeGithub({ permission: 'admin', assignable: (u) => u !== 'ghost' });
-  await run({ github, context: contextFor('/assign @ghost'), core });
-  const comment = calls.find(([n]) => n === 'createComment');
-  assert.match(comment[1].body, /@ghost cannot be assigned/);
+test('/remove-lgtm, /remove-approve and the cancel spelling are maintainer-only', () => {
+  const labels = ['lgtm', 'approved'];
+  const r = plan(parseCommands('/lgtm cancel\n/remove-approve'), { ...prMaintainer, labels });
+  assert.deepEqual(r.removeLabels, ['lgtm', 'approved']);
+  assert.deepEqual(r.addLabels, []);
+
+  const denied = plan(parseCommands('/remove-lgtm\n/approve cancel'), { ...prPastContributor, labels });
+  assert.deepEqual(denied.removeLabels, []);
+  assert.equal(denied.errors.length, 2);
 });
 
-test('run ignores bots and comments without commands', async () => {
-  const bot = fakeGithub({ permission: 'admin' });
-  await run({ github: bot.github, context: contextFor('/close', { login: 'dependabot[bot]', type: 'Bot' }), core });
-  assert.equal(bot.calls.length, 0);
+test('/hold and /unhold work for participants and the author', () => {
+  assert.deepEqual(plan(parseCommands('/hold'), prPastContributor).addLabels, ['do-not-merge/hold']);
+  const author = { ...prNewcomer, commenter: 'bob', labels: ['do-not-merge/hold'] };
+  assert.deepEqual(plan(parseCommands('/hold cancel'), author).removeLabels, ['do-not-merge/hold']);
+  assert.deepEqual(plan(parseCommands('/unhold'), author).removeLabels, ['do-not-merge/hold']);
 
-  const plain = fakeGithub({ permission: 'admin' });
-  await run({ github: plain.github, context: contextFor('Thanks for the fix!'), core });
-  assert.equal(plain.calls.length, 0);
+  const r = plan(parseCommands('/hold'), prNewcomer);
+  assert.deepEqual(r.addLabels, []);
+  assert.equal(r.errors.length, 1);
 });
 
-test('labelNewIssue adds needs-triage unless already triaged', async () => {
-  const fresh = fakeGithub();
-  await labelNewIssue({ github: fresh.github, context: contextFor('', { labels: ['kind/bug'] }) });
-  assert.deepEqual(fresh.calls[0][1].labels, ['needs-triage']);
-
-  const triaged = fakeGithub();
-  await labelNewIssue({ github: triaged.github, context: contextFor('', { labels: ['triage/accepted'] }) });
-  assert.equal(triaged.calls.length, 0);
+test('/retest works for maintainers and the author only', () => {
+  assert.equal(plan(parseCommands('/retest'), prMaintainer).retest, true);
+  assert.equal(plan(parseCommands('/retest'), { ...prNewcomer, commenter: 'bob' }).retest, true);
+  const r = plan(parseCommands('/retest'), prPastContributor);
+  assert.equal(r.retest, false);
+  assert.match(r.errors[0], /maintainers or the author/);
 });
+
+test('/cc and /uncc request and remove reviewers', () => {
+  const r = plan(parseCommands('/cc @dave @erin\n/uncc @frank'), prPastContributor);
+  assert.deepEqual(r.reviewers, ['dave', 'erin']);
+  assert.deepEqual(r.unreviewers, ['frank']);
+
+  assert.match(plan(parseCommands('/cc'), prMaintainer).errors[0], /expects one or more users/);
+  assert.equal(plan(parseCommands('/cc @dave'), prNewcomer).errors.length, 1);
+});
+

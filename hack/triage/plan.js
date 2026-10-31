@@ -14,14 +14,23 @@
  * limitations under the License.
  */
 
-// Prow-style slash commands for issue and PR triage, run by
-// .github/workflows/triage-commands.yml. Only the comment text is read;
-// no pull request code is ever checked out or executed.
+// @ts-check
 
-const DOCS_URL = 'https://github.com/microcks/microcks-cli/blob/master/documentation/triage-commands.md';
+// Decides what a set of commands does. All permission rules live here; no
+// GitHub API calls are made.
 
 const NEEDS_TRIAGE = 'needs-triage';
 const TRIAGE_ACCEPTED = 'triage/accepted';
+// Pull request review signals. They are labels only: merging still needs an
+// approving GitHub review from a code owner, and a maintainer merges by hand.
+// TODO: merge automatically once a PR has lgtm and approved, no hold and green
+// checks, like Prow's Tide. The master ruleset requires a code owner review,
+// so the bot would need a bypass there (or a GitHub App) first; that needs
+// maintainer agreement.
+const LGTM = 'lgtm';
+const APPROVED = 'approved';
+const HOLD = 'do-not-merge/hold';
+const CANCEL = { lgtm: 'remove-lgtm', approve: 'remove-approve', hold: 'unhold' };
 
 // Command argument -> repository label. Only these labels can be set.
 const TRIAGE = {
@@ -53,55 +62,48 @@ const FLAGS = {
   'keep-open': 'keep-open',
 };
 
-const MAINTAINER_PERMISSIONS = ['admin', 'maintain', 'write'];
-// GitHub author associations of people who already have commits in the repository.
-const CONTRIBUTOR_ASSOCIATIONS = ['CONTRIBUTOR', 'COLLABORATOR', 'MEMBER', 'OWNER'];
-const MAX_COMMANDS = 10;
+/**
+ * @typedef {object} Context
+ * @property {string} commenter login of the person who wrote the comment
+ * @property {string | undefined} author login of the issue or pull request author
+ * @property {boolean} isMaintainer commenter has write access or more
+ * @property {boolean} isContributor commenter already has commits in the repository
+ * @property {boolean} isPullRequest the comment is on a pull request
+ * @property {string[]} labels current labels of the issue or pull request
+ * @property {string} [closedBy] login of the person who last closed it, if any
+ */
 
 /**
- * Extracts slash commands from a comment body. Commands must start a line;
- * lines inside fenced code blocks and quoted lines ("> /kind bug") are
- * ignored so that quoting a previous comment does not re-run it.
+ * @typedef {object} Plan
+ * @property {string[]} addLabels
+ * @property {string[]} removeLabels
+ * @property {string[]} assign
+ * @property {string[]} unassign
+ * @property {string[]} reviewers review requests to add
+ * @property {string[]} unreviewers review requests to remove
+ * @property {boolean} retest re-run the failed checks of the pull request
+ * @property {'open' | 'closed' | null} state
+ * @property {string[]} errors explanations for commands that were not applied
  */
-function parseCommands(body) {
-  const commands = [];
-  let inFence = false;
-  for (const raw of String(body || '').split(/\r?\n/)) {
-    const line = raw.trim();
-    if (line.startsWith('```') || line.startsWith('~~~')) {
-      inFence = !inFence;
-      continue;
-    }
-    if (inFence || !line.startsWith('/')) {
-      continue;
-    }
-    const [head, ...args] = line.split(/\s+/);
-    const name = head.slice(1).toLowerCase();
-    if (!/^[a-z][a-z-]*$/.test(name)) {
-      continue;
-    }
-    commands.push({ name, args: args.map((a) => a.replace(/^@/, '')).filter(Boolean) });
-    if (commands.length >= MAX_COMMANDS) {
-      break;
-    }
-  }
-  return commands;
-}
 
 /**
  * Turns parsed commands into the changes to apply. Pure function so it can be
  * unit tested without the GitHub API.
  *
- * ctx: { commenter, author, isMaintainer, isContributor, isPullRequest, labels, assignees }
- *
  * Maintainers can use every command. Contributors (people with commits in the
  * repository) can add triage and label values, but not on their own issues;
  * removing labels stays with maintainers so they can correct a triage.
- * returns: { addLabels, removeLabels, assign, unassign, state, errors }
+ *
+ * @param {import('./parse').Command[]} commands
+ * @param {Context} ctx
+ * @returns {Plan}
  */
 function plan(commands, ctx) {
   const labels = new Set(ctx.labels);
-  const out = { addLabels: [], removeLabels: [], assign: [], unassign: [], state: null, errors: [] };
+  /** @type {Plan} */
+  const out = {
+    addLabels: [], removeLabels: [], assign: [], unassign: [], reviewers: [], unreviewers: [], retest: false, state: null, errors: [],
+  };
 
   const add = (label) => {
     if (!labels.has(label)) {
@@ -137,6 +139,19 @@ function plan(commands, ctx) {
     }
     return true;
   };
+  const needPullRequest = (cmd) => {
+    if (!ctx.isPullRequest) {
+      out.errors.push(`\`/${cmd}\` can only be used on pull requests.`);
+      return false;
+    }
+    return true;
+  };
+  // Maintainers, contributors and the pull request author.
+  const needParticipant = (cmd) => {
+    if (ctx.isMaintainer || ctx.isContributor || isAuthor) return true;
+    out.errors.push(`\`/${cmd}\` can be used by maintainers, by people who have contributed to this repository, and by the author.`);
+    return false;
+  };
   const mapped = (cmd, table, arg) => {
     const label = table[String(arg || '').toLowerCase()];
     if (!label) {
@@ -158,7 +173,9 @@ function plan(commands, ctx) {
     }
   };
 
-  for (const { name, args } of commands) {
+  for (const command of commands) {
+    const { args } = command;
+    const name = CANCEL[command.name] && String(args[0]).toLowerCase() === 'cancel' ? CANCEL[command.name] : command.name;
     switch (name) {
       case 'triage': {
         if (!needTriager(name)) break;
@@ -238,9 +255,56 @@ function plan(commands, ctx) {
           out.errors.push(`\`/${name}\` can only be used by maintainers or the author.`);
           break;
         }
+        // Like GitHub itself, the author can only reopen what they closed, not
+        // an item a maintainer closed (for example as out of scope).
+        const closedBySomeoneElse = Boolean(ctx.closedBy) && ctx.closedBy.toLowerCase() !== ctx.commenter.toLowerCase();
+        if (name === 'reopen' && !ctx.isMaintainer && closedBySomeoneElse) {
+          out.errors.push('`/reopen` can\'t reopen an item a maintainer closed. Please ask a maintainer if you think it should be reopened.');
+          break;
+        }
         out.state = name === 'close' ? 'closed' : 'open';
         break;
       }
+      case 'lgtm':
+        if (!needPullRequest(name)) break;
+        if (isAuthor) {
+          out.errors.push('`/lgtm` can\'t be used on your own pull request.');
+          break;
+        }
+        if (!needTriager(name)) break;
+        add(LGTM);
+        break;
+      case 'approve':
+        if (!needPullRequest(name) || !needMaintainer(name)) break;
+        add(APPROVED);
+        break;
+      case 'remove-lgtm':
+      case 'remove-approve':
+        if (!needPullRequest(name) || !needMaintainer(name)) break;
+        remove(name === 'remove-lgtm' ? LGTM : APPROVED);
+        break;
+      case 'hold':
+      case 'unhold':
+        if (!needPullRequest(name) || !needParticipant(name)) break;
+        (name === 'hold' ? add : remove)(HOLD);
+        break;
+      case 'retest':
+        if (!needPullRequest(name)) break;
+        if (!ctx.isMaintainer && !isAuthor) {
+          out.errors.push('`/retest` can only be used by maintainers or the author.');
+          break;
+        }
+        out.retest = true;
+        break;
+      case 'cc':
+      case 'uncc':
+        if (!needPullRequest(name) || !needParticipant(name)) break;
+        if (args.length === 0) {
+          out.errors.push(`\`/${name}\` expects one or more users, for example \`/${name} @user\`.`);
+          break;
+        }
+        (name === 'cc' ? out.reviewers : out.unreviewers).push(...args);
+        break;
       default:
         // Unknown commands are ignored, like Prow does, so "/path/to/file"
         // or other text starting with a slash does not trigger a reply.
@@ -250,108 +314,4 @@ function plan(commands, ctx) {
   return out;
 }
 
-async function isMaintainer(github, owner, repo, username) {
-  try {
-    const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username });
-    return MAINTAINER_PERMISSIONS.includes(data.permission);
-  } catch (err) {
-    // 404 means the user is not a collaborator.
-    if (err.status === 404) return false;
-    throw err;
-  }
-}
-
-/**
- * Entry point called from actions/github-script.
- */
-async function run({ github, context, core }) {
-  const { comment, issue } = context.payload;
-  if (!comment || !issue || comment.user.type === 'Bot') return;
-
-  const commands = parseCommands(comment.body);
-  if (commands.length === 0) return;
-
-  const { owner, repo } = context.repo;
-  const issue_number = issue.number;
-  const commenter = comment.user.login;
-
-  const maintainer = await isMaintainer(github, owner, repo, commenter);
-  const result = plan(commands, {
-    commenter,
-    author: issue.user && issue.user.login,
-    isMaintainer: maintainer,
-    isContributor: maintainer || CONTRIBUTOR_ASSOCIATIONS.includes(comment.author_association),
-    isPullRequest: Boolean(issue.pull_request),
-    labels: (issue.labels || []).map((l) => (typeof l === 'string' ? l : l.name)),
-    assignees: (issue.assignees || []).map((a) => a.login),
-  });
-
-  const failures = [...result.errors];
-  const attempt = async (what, fn) => {
-    try {
-      await fn();
-    } catch (err) {
-      core.warning(`${what}: ${err.message}`);
-      failures.push(`Could not ${what}: ${err.message}`);
-    }
-  };
-
-  for (const name of result.removeLabels) {
-    await attempt(`remove label \`${name}\``, () => github.rest.issues.removeLabel({ owner, repo, issue_number, name }));
-  }
-  if (result.addLabels.length) {
-    await attempt(`add ${result.addLabels.map((l) => `\`${l}\``).join(', ')}`, () =>
-      github.rest.issues.addLabels({ owner, repo, issue_number, labels: result.addLabels }));
-  }
-  if (result.unassign.length) {
-    await attempt('unassign', () => github.rest.issues.removeAssignees({ owner, repo, issue_number, assignees: result.unassign }));
-  }
-  if (result.assign.length) {
-    await attempt('assign', async () => {
-      const { data } = await github.rest.issues.addAssignees({ owner, repo, issue_number, assignees: result.assign });
-      const assigned = new Set((data.assignees || []).map((a) => a.login.toLowerCase()));
-      const missing = result.assign.filter((u) => !assigned.has(u.toLowerCase()));
-      if (missing.length) {
-        throw new Error(`${missing.map((u) => `@${u}`).join(', ')} cannot be assigned. They need to comment on this issue first.`);
-      }
-    });
-  }
-  if (result.state) {
-    await attempt(result.state === 'closed' ? 'close' : 'reopen', () =>
-      github.rest.issues.update({ owner, repo, issue_number, state: result.state }));
-  }
-
-  const changed = result.addLabels.length || result.removeLabels.length || result.assign.length
-    || result.unassign.length || result.state;
-  if (changed && failures.length === 0) {
-    await github.rest.reactions.createForIssueComment({ owner, repo, comment_id: comment.id, content: '+1' });
-  }
-  if (failures.length) {
-    await github.rest.reactions.createForIssueComment({ owner, repo, comment_id: comment.id, content: 'confused' });
-    const lines = failures.map((f) => `- ${f}`).join('\n');
-    await github.rest.issues.createComment({
-      owner,
-      repo,
-      issue_number,
-      body: `@${commenter} thanks! Some commands were not applied:\n\n${lines}\n\nSee the [triage commands](${DOCS_URL}) for details.`,
-    });
-  }
-}
-
-/**
- * Adds needs-triage to newly opened issues, unless a maintainer already
- * triaged them through a label.
- */
-async function labelNewIssue({ github, context }) {
-  const { issue } = context.payload;
-  if (!issue) return;
-  const labels = (issue.labels || []).map((l) => (typeof l === 'string' ? l : l.name));
-  if (labels.some((l) => l.startsWith('triage/'))) return;
-  await github.rest.issues.addLabels({
-    ...context.repo,
-    issue_number: issue.number,
-    labels: [NEEDS_TRIAGE],
-  });
-}
-
-module.exports = { run, labelNewIssue, parseCommands, plan };
+module.exports = { plan, NEEDS_TRIAGE, HOLD };

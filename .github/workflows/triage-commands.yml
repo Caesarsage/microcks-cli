@@ -1,8 +1,9 @@
-# Prow-style slash commands (/triage accepted, /kind bug, /assign, ...) for issues and PRs.
+# Prow-style slash commands for issues and PRs: /triage accepted, /kind bug, /assign,
+# and on PRs /lgtm, /approve, /hold, /retest, /cc, ...
 # See documentation/triage-commands.md for the command list.
 #
 # Security: both events run in the context of the default branch, and the job only
-# checks out .github/scripts from it. Pull request code is never checked out or run;
+# checks out hack/triage from it. Pull request code is never checked out or run;
 # commands are read from the comment text only.
 
 name: triage-commands
@@ -28,14 +29,14 @@ jobs:
       - name: Checkout triage scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
-          sparse-checkout: .github/scripts
+          sparse-checkout: hack/triage
           persist-credentials: false
 
       - name: Add needs-triage label
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            const { labelNewIssue } = require('./.github/scripts/triage-commands.js')
+            const { labelNewIssue } = require('./hack/triage/run.js')
             await labelNewIssue({ github, context })
 
   commands:
@@ -48,6 +49,8 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
+      # /retest re-runs failed workflow runs of a pull request.
+      actions: write
     concurrency:
       group: triage-commands-${{ github.event.issue.number }}
       cancel-in-progress: false
@@ -55,12 +58,12 @@ jobs:
       - name: Checkout triage scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
-          sparse-checkout: .github/scripts
+          sparse-checkout: hack/triage
           persist-credentials: false
 
       - name: Apply slash commands
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            const { run } = require('./.github/scripts/triage-commands.js')
+            const { run } = require('./hack/triage/run.js')
             await run({ github, context, core })
